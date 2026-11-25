@@ -700,7 +700,14 @@ function parseCSV(text){
 /* ---------- PDF reading ----------
    Most PDFs keep their page text inside compressed (FlateDecode) content
    streams, so scanning the raw bytes finds nothing. Inflate every stream,
-   pull the strings out of the text-drawing operations, then read the rows. */
+   pull the strings out of the text-drawing operations, then read the rows.
+   Browser-printed PDFs (Chrome and friends) go one step further: the text
+   is stored as two-byte CID codes in subset Type0/CIDFontType2 fonts, so
+   the drawn strings are gibberish until they are run through each font's
+   ToUnicode CMap (beginbfchar / beginbfrange). So the file is split into
+   objects, every font's CID -> Unicode map is built from its ToUnicode
+   stream, and each Tj/TJ string is decoded with the map of the font the
+   preceding Tf operator selected. */
 function pdfInflate(bytes){
   return new Promise(function(resolve){
     try{
@@ -711,27 +718,331 @@ function pdfInflate(bytes){
     }catch(e){ resolve(null); }
   });
 }
-function pdfStreamTexts(buf){
+function pdfHexBytes(hex){
+  hex=String(hex).replace(/\s/g,"");
+  var bytes=[]; for(var i=0;i+1<hex.length;i+=2) bytes.push(parseInt(hex.substr(i,2),16));
+  return bytes;
+}
+/* A ToUnicode destination string is UTF-16BE */
+function pdfDstText(hex){
+  var bytes=pdfHexBytes(hex), s="", i;
+  if(bytes.length===1) return String.fromCharCode(bytes[0]);
+  for(i=0;i+1<bytes.length;i+=2) s+=String.fromCharCode((bytes[i]<<8)|bytes[i+1]);
+  if(i<bytes.length) s+=String.fromCharCode(bytes[bytes.length-1]);
+  return s;
+}
+/* Split the file into indirect objects. A stream is cut by its dictionary's
+   /Length when that is a direct number, otherwise by the endstream marker,
+   and inflated when the dictionary says FlateDecode. Each object ends up
+   with its dictionary text and its decoded stream text (latin1). */
+function pdfObjects(buf){
   var bytes=new Uint8Array(buf);
   var raw=new TextDecoder("latin1").decode(bytes);
-  var jobs=[], idx=0;
-  while(true){
-    var s=raw.indexOf("stream",idx); if(s<0) break;
-    if(raw.slice(Math.max(0,s-3),s)==="end"){ idx=s+6; continue; }
-    var start=s+6; if(raw.charAt(start)==="\r") start++; if(raw.charAt(start)==="\n") start++;
-    var e=raw.indexOf("endstream",start); if(e<0) break;
-    var dict=raw.slice(Math.max(0,s-400),s);
-    var lm=/\/Length\s+(\d+)(?!\s+\d+\s+R)/.exec(dict); /* exact byte count when the dictionary gives one directly */
-    var slice;
-    if(lm && start+parseInt(lm[1],10)<=bytes.length) slice=bytes.slice(start, start+parseInt(lm[1],10));
-    else { slice=bytes.slice(start,e); while(slice.length && (slice[slice.length-1]===10 || slice[slice.length-1]===13)) slice=slice.slice(0,slice.length-1); } /* decoders reject trailing junk after a compressed stream */
-    jobs.push((/FlateDecode/.test(dict) ? pdfInflate(slice) : Promise.resolve(slice)).then(function(out){
-      return out ? new TextDecoder("latin1").decode(out) : "";
-    }));
-    idx=e+9;
+  var objs=[], re=/(\d+)\s+(\d+)\s+obj\b/g, m;
+  while((m=re.exec(raw))!==null){
+    var start=re.lastIndex;
+    var end=raw.indexOf("endobj",start); if(end<0) end=raw.length;
+    var sIdx=raw.indexOf("stream",start);
+    var hasStream=(sIdx>=0 && sIdx<end);
+    var dict=raw.slice(start, hasStream?sIdx:end);
+    var slice=null;
+    if(hasStream){
+      var ds0=sIdx+6; if(raw.charAt(ds0)==="\r") ds0++; if(raw.charAt(ds0)==="\n") ds0++;
+      var lm=/\/Length\s+(\d+)(?!\s+\d+\s+R)/.exec(dict); /* exact byte count when the dictionary gives one directly */
+      var len=lm?parseInt(lm[1],10):-1;
+      if(len>=0 && ds0+len<=bytes.length) slice=bytes.slice(ds0,ds0+len);
+      else{
+        var eIdx=raw.indexOf("endstream",ds0); if(eIdx<0 || eIdx>end) eIdx=end;
+        slice=bytes.slice(ds0,eIdx); /* decoders reject trailing junk after a compressed stream */
+        var n=slice.length; while(n>0 && (slice[n-1]===10 || slice[n-1]===13)) n--;
+        slice=slice.slice(0,n);
+      }
+    }
+    objs.push({num:parseInt(m[1],10), dict:dict, stream:slice, flate:/FlateDecode/.test(dict), text:""});
   }
-  jobs.push(Promise.resolve(raw)); /* uncompressed PDFs keep their text inline */
-  return Promise.all(jobs).then(function(parts){ return parts.join("\n"); });
+  return Promise.all(objs.map(function(o){
+    if(!o.stream){ return Promise.resolve(o); }
+    if(!o.flate){ o.text=new TextDecoder("latin1").decode(o.stream); return Promise.resolve(o); }
+    return pdfInflate(o.stream).then(function(out){
+      o.text=new TextDecoder("latin1").decode(out||o.stream);
+      return o;
+    });
+  })).then(function(list){ return {raw:raw, objs:list}; });
+}
+/* Parse one ToUnicode CMap stream into {cid: unicode string} */
+function pdfParseCMap(text){
+  var map={}, sec, pair, range;
+  var secRe=/beginbfchar([\s\S]*?)endbfchar/g;
+  while((sec=secRe.exec(text))!==null){
+    var pRe=/<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>/g;
+    while((pair=pRe.exec(sec[1]))!==null) map[parseInt(pair[1],16)]=pdfDstText(pair[2]);
+  }
+  var rSecRe=/beginbfrange([\s\S]*?)endbfrange/g;
+  while((sec=rSecRe.exec(text))!==null){
+    var rRe=/<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*(?:<([0-9A-Fa-f]+)>|\[([^\]]*)\])/g;
+    while((range=rRe.exec(sec[1]))!==null){
+      var lo=parseInt(range[1],16), hi=parseInt(range[2],16);
+      if(hi<lo || hi-lo>70000) continue;
+      if(range[3]!==undefined && range[3]!==null){
+        var base=pdfDstText(range[3]);
+        for(var c=lo;c<=hi && base.length;c++)
+          map[c]=base.slice(0,-1)+String.fromCharCode(base.charCodeAt(base.length-1)+(c-lo));
+      }else if(range[4]){
+        var dRe=/<([0-9A-Fa-f]+)>/g, dst, k=0;
+        while((dst=dRe.exec(range[4]))!==null && lo+k<=hi){ map[lo+k]=pdfDstText(dst[1]); k++; }
+      }
+    }
+  }
+  return map;
+}
+/* A CIDFont's /W array gives each CID's advance width (in thousandths of an
+   em), in two shapes: "c [w w ...]" for consecutive CIDs and "c1 c2 w" for a
+   whole range at one width. /DW is the width of any CID not listed. These
+   widths are what let the text walk below tell a run that continues the
+   previous one (zero gap) from a new word or cell (a real gap). */
+function pdfParseWidths(dict){
+  var dw=1000, dm=/\/DW\s+(\d+(?:\.\d+)?)/.exec(dict);
+  if(dm) dw=parseFloat(dm[1]);
+  var widths={};
+  var wm=/\/W\s*\[/.exec(dict);
+  if(wm){
+    var bi=wm.index+wm[0].length-1, depth=0, j=bi, ch;
+    for(; j<dict.length; j++){
+      ch=dict.charAt(j);
+      if(ch==="[") depth++;
+      else if(ch==="]"){ depth--; if(depth===0){ j++; break; } }
+    }
+    var toks=dict.slice(bi,j).match(/\[|\]|-?\d+(?:\.\d+)?/g)||[];
+    function isNum(t){ return t && /^-?\d/.test(t); }
+    var i=0;
+    while(i<toks.length){
+      if(!isNum(toks[i])){ i++; continue; }
+      var c=parseFloat(toks[i]);
+      if(toks[i+1]==="["){
+        var k=i+2, vals=[];
+        while(k<toks.length && toks[k]!=="]"){ if(isNum(toks[k])) vals.push(parseFloat(toks[k])); k++; }
+        for(var v=0;v<vals.length;v++) widths[c+v]=vals[v];
+        i=k+1;
+      }else if(isNum(toks[i+1]) && isNum(toks[i+2])){
+        var c2=parseFloat(toks[i+1]), wv=parseFloat(toks[i+2]);
+        if(c2>=c && c2-c<10000) for(var q=c;q<=c2;q++) widths[q]=wv;
+        i+=3;
+      }else i++;
+    }
+  }
+  return {dw:dw, widths:widths};
+}
+/* Work out which resource font name (/F1, /F2, ...) uses which ToUnicode map:
+   font object --/ToUnicode--> CMap object, and page resources bind a name to
+   each font object. The same walk also picks up each font's glyph widths
+   from its descendant CIDFont's /W array. */
+function pdfFontMaps(doc){
+  var byObj={}, fontObjMap={}, nameToMap={}, nameToWidth={}, nameToDW={}, i, o, tm;
+  var byNum={};
+  for(i=0;i<doc.objs.length;i++) byNum[doc.objs[i].num]=doc.objs[i];
+  for(i=0;i<doc.objs.length;i++){
+    o=doc.objs[i];
+    if(o.text && /beginbf(char|range)/.test(o.text)) byObj[o.num]=pdfParseCMap(o.text);
+  }
+  for(i=0;i<doc.objs.length;i++){
+    o=doc.objs[i];
+    tm=/\/ToUnicode\s+(\d+)\s+\d+\s+R/.exec(o.dict);
+    if(tm && byObj[parseInt(tm[1],10)]){
+      fontObjMap[o.num]=byObj[parseInt(tm[1],10)];
+      var dm=/\/DescendantFonts\s*\[?\s*(\d+)\s+\d+\s+R/.exec(o.dict), desc, pw;
+      if(dm && (desc=byNum[parseInt(dm[1],10)])){
+        pw=pdfParseWidths(desc.dict);
+        nameToWidth[o.num]=pw.widths; nameToDW[o.num]=pw.dw;
+      }
+    }
+  }
+  var scan=[doc.raw];
+  for(i=0;i<doc.objs.length;i++) if(doc.objs[i].dict) scan.push(doc.objs[i].dict);
+  scan.forEach(function(txt){
+    var rRe=/\/([A-Za-z0-9_.\-]+)\s+(\d+)\s+\d+\s+R/g, mm;
+    while((mm=rRe.exec(txt))!==null){
+      var ref=parseInt(mm[2],10), fm=fontObjMap[ref];
+      if(fm){
+        nameToMap[mm[1]]=fm;
+        if(nameToWidth[ref]) nameToWidth[mm[1]]=nameToWidth[ref];
+        if(nameToDW[ref]) nameToDW[mm[1]]=nameToDW[ref];
+      }
+    }
+  });
+  return {maps:nameToMap, widths:nameToWidth, dws:nameToDW};
+}
+/* The streams a page actually draws with: its /Contents objects when the
+   file names them, otherwise any stream that opens a text block. */
+function pdfContentObjs(doc){
+  var wanted={}, any=false, m, mm;
+  var re1=/\/Contents\s+(\d+)\s+\d+\s+R/g;
+  while((m=re1.exec(doc.raw))!==null){ wanted[parseInt(m[1],10)]=1; any=true; }
+  var re2=/\/Contents\s*\[([^\]]*)\]/g;
+  while((m=re2.exec(doc.raw))!==null){
+    var inner=/(\d+)\s+\d+\s+R/g;
+    while((mm=inner.exec(m[1]))!==null){ wanted[parseInt(mm[1],10)]=1; any=true; }
+  }
+  if(any) return doc.objs.filter(function(o){ return wanted[o.num] && o.stream; });
+  return doc.objs.filter(function(o){ return o.stream && o.text && /\bBT\b/.test(o.text); });
+}
+/* Tokenize a content stream: literal strings, hex strings, names, numbers,
+   arrays and operators, in drawing order */
+function pdfTokens(s){
+  var toks=[], i=0, n=s.length;
+  while(i<n){
+    var c=s.charAt(i);
+    if(c==="%"){ while(i<n && s.charAt(i)!=="\n" && s.charAt(i)!=="\r") i++; continue; }
+    if(/\s/.test(c)){ i++; continue; }
+    if(c==="("){
+      var depth=1, j=i+1, inner="", ch;
+      while(j<n && depth>0){
+        ch=s.charAt(j);
+        if(ch==="\\"){ inner+=s.substr(j,2); j+=2; continue; }
+        if(ch==="("){ depth++; inner+=ch; j++; continue; }
+        if(ch===")"){ depth--; j++; if(depth===0) break; inner+=ch; continue; }
+        inner+=ch; j++;
+      }
+      toks.push({t:"str", v:inner}); i=j; continue;
+    }
+    if(c==="<" && s.charAt(i+1)!=="<"){
+      var gt=s.indexOf(">",i); if(gt<0) break;
+      toks.push({t:"hex", v:s.slice(i+1,gt)}); i=gt+1; continue;
+    }
+    if(c==="<" || c===">"){ toks.push({t:"op", v:s.substr(i,2)}); i+=2; continue; }
+    if(c==="["){ toks.push({t:"["}); i++; continue; }
+    if(c==="]"){ toks.push({t:"]"}); i++; continue; }
+    if(c==="/"){
+      var k=i+1; while(k<n && !/[\s\[\]<>()\/%]/.test(s.charAt(k))) k++;
+      toks.push({t:"name", v:s.slice(i+1,k)}); i=k; continue;
+    }
+    var k2=i; while(k2<n && !/[\s\[\]<>()\/%]/.test(s.charAt(k2))) k2++;
+    var w=s.slice(i,k2);
+    toks.push(/^[+-]?(\d+\.?\d*|\.\d+)$/.test(w) ? {t:"num", v:parseFloat(w)} : {t:"op", v:w});
+    i=k2;
+  }
+  return toks;
+}
+/* Decode one shown string, and report its advance width in thousandths of
+   an em alongside the text. With a ToUnicode map for the current font, the
+   bytes are CID codes (two bytes each under Identity-H, one byte as a
+   fallback) and the width comes from the font's /W array; without a map,
+   fall back to the plain string reading and a rough half-em per character. */
+function pdfDecodeShow(tok, map, widths, dw){
+  var bytes=[], i, un;
+  if(tok.t==="hex") bytes=pdfHexBytes(tok.v);
+  else{ un=pdfUnescape(tok.v); for(i=0;i<un.length;i++) bytes.push(un.charCodeAt(i)&0xff); }
+  if(map){
+    var out="", w=0, used=false;
+    function widthOf(cid){ return (widths && widths[cid]!==undefined) ? widths[cid] : (dw||1000); }
+    i=0;
+    while(i<bytes.length){
+      if(i+1<bytes.length){
+        var cid2=(bytes[i]<<8)|bytes[i+1];
+        if(Object.prototype.hasOwnProperty.call(map,cid2)){ out+=map[cid2]; w+=widthOf(cid2); used=true; i+=2; continue; }
+      }
+      if(Object.prototype.hasOwnProperty.call(map,bytes[i])){ out+=map[bytes[i]]; w+=widthOf(bytes[i]); used=true; i+=1; continue; }
+      i+=(i+1<bytes.length)?2:1; /* unknown CID: skip it rather than emit gibberish */
+    }
+    if(used) return {text:out, w:w};
+  }
+  var plain=(tok.t==="hex") ? pdfHexText(tok.v) : pdfUnescape(tok.v);
+  return {text:plain, w:plain.length*500};
+}
+/* Walk the content streams and rebuild the text with its layout. Tf selects
+   the font whose map decodes the next Tj/TJ strings and sets the size; Tm
+   and Td/TD position each run. Browser printers split a single word into
+   several runs that continue at exactly the previous run's end (the Td
+   step equals the drawn advance), so the separator between two runs is
+   decided by position: a new baseline means a new line, a gap wider than
+   a space means a word break, and a zero gap means the runs are one word. */
+function pdfContentText2(contentObjs, fonts){
+  var nameToMap=fonts.maps||{}, nameToWidth=fonts.widths||{}, nameToDW=fonts.dws||{};
+  var out=[];
+  var font=null, fontSize=12;
+  var lineX=null, lineY=null, penX=null, penY=null, startX=null, startY=null;
+  var prevEndX=null, prevY=null, prevSize=12, forceNL=false;
+  function showRun(txt, adv){
+    if(!txt) return;
+    var sx=(startX!==null)?startX:penX, sy=(startY!==null)?startY:penY;
+    if(prevEndX!==null && sx!==null && sy!==null && prevY!==null){
+      if(forceNL || Math.abs(sy-prevY) > Math.max(2, prevSize*0.35)) out.push("\n");
+      else if(sx-prevEndX > fontSize*0.16) out.push(" ");
+    }
+    out.push(txt);
+    if(sx!==null){ penX=sx+adv; penY=sy; prevEndX=penX; prevY=sy; prevSize=fontSize; }
+    startX=null; startY=null; forceNL=false;
+  }
+  function decode(tok){ return pdfDecodeShow(tok, font?nameToMap[font]:null, font?nameToWidth[font]:null, font?nameToDW[font]:null); }
+  contentObjs.forEach(function(o){
+    var toks=pdfTokens(o.text), stack=[];
+    function nums(){ return stack.filter(function(a){ return a.t==="num"; }).map(function(a){ return a.v; }); }
+    for(var i=0;i<toks.length;i++){
+      var tk=toks[i];
+      if(tk.t==="["){
+        var arr=[], depth=1; i++;
+        while(i<toks.length && depth>0){
+          var innerTk=toks[i];
+          if(innerTk.t==="[") depth++;
+          else if(innerTk.t==="]"){ depth--; if(depth===0) break; }
+          arr.push(innerTk); i++;
+        }
+        stack.push({t:"arr", v:arr}); continue;
+      }
+      if(tk.t!=="op"){ stack.push(tk); continue; }
+      var op=tk.v, ns;
+      if(op==="Tf"){
+        stack.forEach(function(a){ if(a.t==="name") font=a.v; });
+        ns=nums(); if(ns.length) fontSize=ns[ns.length-1];
+      }
+      else if(op==="Tm"){
+        ns=nums();
+        if(ns.length>=6){ lineX=ns[ns.length-2]; lineY=ns[ns.length-1]; startX=lineX; startY=lineY; }
+      }
+      else if(op==="Td" || op==="TD"){
+        ns=nums();
+        if(ns.length>=2){
+          lineX=(lineX||0)+ns[ns.length-2]; lineY=(lineY||0)+ns[ns.length-1];
+          startX=lineX; startY=lineY;
+        }
+      }
+      else if(op==="T*"){ forceNL=true; startX=null; }
+      else if(op==="Tj"){
+        var top1=stack[stack.length-1];
+        if(top1 && (top1.t==="str" || top1.t==="hex")){ var r1=decode(top1); showRun(r1.text, r1.w/1000*fontSize); }
+      }
+      else if(op==="'" || op==='"'){
+        forceNL=true;
+        var top2=stack[stack.length-1];
+        if(top2 && (top2.t==="str" || top2.t==="hex")){ var r2=decode(top2); showRun(r2.text, r2.w/1000*fontSize); }
+      }
+      else if(op==="TJ"){
+        var top3=stack[stack.length-1];
+        if(top3 && top3.t==="arr"){
+          var txt="", tw=0;
+          top3.v.forEach(function(el){
+            if(el.t==="str" || el.t==="hex"){ var rr=decode(el); txt+=rr.text; tw+=rr.w; }
+            else if(el.t==="num"){ tw-=el.v; if(el.v<-180) txt+=" "; /* a wide TJ adjustment is a word gap */ }
+          });
+          showRun(txt, tw/1000*fontSize);
+        }
+      }
+      stack=[];
+    }
+    out.push("\n");
+    prevEndX=null; prevY=null; startX=null; startY=null; penX=null; penY=null;
+  });
+  return out.join("");
+}
+function pdfExtractText(buf){
+  return pdfObjects(buf).then(function(doc){
+    var text=pdfContentText2(pdfContentObjs(doc), pdfFontMaps(doc));
+    if(text.replace(/\s/g,"")) return text;
+    /* Fallback: the loose scan over every stream, for files whose text the
+       structured walk found nothing in */
+    var parts=doc.objs.map(function(o){ return o.text||""; });
+    parts.push(doc.raw);
+    return pdfContentText(parts.join("\n"));
+  });
 }
 function pdfUnescape(s){
   return s.replace(/\\([0-7]{1,3}|.)/g,function(m,c){
@@ -790,9 +1101,8 @@ $("fileInput").addEventListener("change",function(e){
   var reader=new FileReader();
   reader.onload=function(){
     if(isPdf){
-      /* PDF: extract the text properly (streams are usually compressed), read the unit rows out of it, and review anything missed — PDF layouts vary by operator, and the live version has the same manual review step after parsing */
-      pdfStreamTexts(reader.result).then(function(content){
-        var text=pdfContentText(content);
+      /* PDF: extract the text properly (streams are usually compressed, and browser-printed files store it as CID codes that only each font's ToUnicode map can decode), read the unit rows out of it, and review anything missed — PDF layouts vary by operator, and the live version has the same manual review step after parsing */
+      pdfExtractText(reader.result).then(function(text){
         var found=parsePdfUnits(text);
         if(!found.length){
           /* Fallback for sheets without unit IDs: a size followed shortly by a price */
