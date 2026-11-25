@@ -138,8 +138,8 @@
     .formrow select,.formrow input{flex:1 1 calc(50% - 4px);min-width:0}
     #addSize{flex:1 1 calc(50% - 4px);min-width:0}
     .formrow button{flex:1 1 100%}
-    .u-label{font-size:10.5px;padding:1px 5px}
-    .u-label small{font-size:9px}
+    .u-label{font-size:9.5px;padding:0 4px;line-height:1.25;border-width:1px;border-radius:6px}
+    .u-label small{font-size:8px;line-height:1.2}
     .hintbar{font-size:11px;left:6px;bottom:6px;max-width:calc(100% - 12px)}
     .legend{gap:8px;font-size:11.5px;padding:8px 10px}
   }
@@ -577,7 +577,7 @@ function loop(){
       it.top=Math.min(Math.max(3,h-it.h-rb), Math.max(3, it.top));
     }
     items.forEach(function(it){ it.cx=it.ax; it.top=it.ay-it.h-6; clampItem(it); });
-    for(var pass=0; pass<80; pass++){
+    for(var pass=0, maxPass=(w<=640?600:80); pass<maxPass; pass++){
       var moved=false;
       for(var i=0;i<items.length;i++) for(var j=i+1;j<items.length;j++){
         var a=items[i], b=items[j];
