@@ -680,7 +680,7 @@ function parseCSV(text){
   if(!lines.length) return [];
   var out=[], start=0;
   var head=lines[0].toLowerCase();
-  if(/unit|仓|size|尺寸|price|价/.test(head)) start=1;
+  if(/unit|size|price/.test(head)) start=1;
   for(var i=start;i<lines.length;i++){
     var cols=lines[i].split(/[,;\t]/).map(function(c){return c.trim().replace(/^"|"$/g,"");});
     if(cols.length<3) continue;
@@ -689,8 +689,8 @@ function parseCSV(text){
       var ns=normSize(c); if(ns && !size){size=ns;return;}
       var num=parseFloat(c.replace(/[^0-9.]/g,""));
       if(!isNaN(num) && /^\$?[\d,]+(\.\d+)?$/.test(c.replace(/\s/g,"")) && price===null && num>20){price=Math.round(num);return;}
-      if(/rent|租出|已租|occupied/i.test(c)) status="rented";
-      else if(/vacan|空置|空/i.test(c)) status="vacant";
+      if(/rent|occupied/i.test(c)) status="rented";
+      else if(/vacan/i.test(c)) status="vacant";
       else if(!id && /[A-Za-z]/.test(c) && !ns) id=c;
     });
     if(size && price!==null) out.push({id:id||("U-"+(out.length+1)),size:size,price:price,status:status,seq:seqCounter++});
