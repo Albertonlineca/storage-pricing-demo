@@ -99,7 +99,7 @@
   .upload-zone label{display:inline-block;background:var(--ink);color:var(--bg);border-radius:10px;padding:9px 16px;font-weight:700;cursor:pointer;min-height:38px;line-height:22px}
   .formrow{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;align-items:center}
   .formrow select,.formrow input{flex:1;min-width:110px}
-  #addSize{flex:1 0 196px;min-width:196px}
+  #addSize{flex:1 0 212px;min-width:212px}
   .formrow .sample-tag{flex:0 0 auto}
   .note{font-size:12.5px;color:var(--muted);margin-top:8px}
   table{width:100%;border-collapse:collapse;font-size:13.5px}
@@ -136,7 +136,7 @@
     .big-price{gap:8px}
     .big-price .bp b{font-size:19px}
     .formrow select,.formrow input{flex:1 1 calc(50% - 4px);min-width:0}
-    #addSize{flex:1 1 calc(50% - 4px);min-width:0}
+    #addSize{flex:1 1 calc(50% - 4px);min-width:180px}
     .formrow button{flex:1 1 100%}
     .u-label{font-size:9.5px;padding:0 4px;line-height:1.25;border-width:1px;border-radius:6px}
     .u-label small{font-size:8px;line-height:1.2}
@@ -302,7 +302,7 @@ function suggested(u){
   var med = compMedian(u.size);
   if(!med) return u.price;
   var occ = sizeOccupancy(u.size);
-  var factor = occ>=0.8 ? 1.0 : (occ>=0.6 ? 0.985 : 0.97); /* The higher this size's occupancy, the closer to the median; with lots vacant, price slightly below the median to fill units first */
+  var factor = Math.min(1, 0.935 + 0.085*occ); /* Continuous in occupancy: the fuller this size is, the closer to the nearby median (never above it); with lots vacant, price further below the median to fill units first. Because it is continuous, any rented/vacant change moves the raw figure enough to survive the $5 rounding below */
   var s = Math.round(med*factor);
   s = Math.round(s/5)*5; /* Round to the nearest $5, like a real list price */
   if (u.status==="vacant" && s < u.price && (u.price - s) < 4) s = u.price; /* Not worth changing for a tiny difference */
@@ -314,7 +314,7 @@ function isLow(u){return u.status==="vacant" && suggested(u) >= u.price + Math.m
 function $(id){return document.getElementById(id);}
 function money(n){return "$"+Math.round(Number(n)).toLocaleString("en-CA");}
 var toastTimer=null;
-function toast(msg){var t=$("toast");t.textContent=msg;t.classList.add("show");clearTimeout(toastTimer);toastTimer=setTimeout(function(){t.classList.remove("show");},3400);}
+function toast(msg,ms){var t=$("toast");t.textContent=msg;t.classList.add("show");clearTimeout(toastTimer);toastTimer=setTimeout(function(){t.classList.remove("show");},ms||3400);}
 function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c];});}
 
 /* ---------- Stats / table / details ---------- */
@@ -457,6 +457,9 @@ function layoutPositions(){
   } else layoutBounds=null;
   return pos;
 }
+/* Back to the canonical 3/4 view: largest units sit at the back from this
+   angle, so no box hides a smaller neighbour behind it */
+function resetCamAngles(){ camTheta=0.85; camPhi=0.95; }
 /* Centre the camera on the current layout and zoom so all units fit the stage */
 function fitView(){
   if(!layoutBounds || !camTarget) return;
@@ -694,24 +697,117 @@ function parseCSV(text){
   }
   return out;
 }
+/* ---------- PDF reading ----------
+   Most PDFs keep their page text inside compressed (FlateDecode) content
+   streams, so scanning the raw bytes finds nothing. Inflate every stream,
+   pull the strings out of the text-drawing operations, then read the rows. */
+function pdfInflate(bytes){
+  return new Promise(function(resolve){
+    try{
+      var ds=new DecompressionStream("deflate");
+      new Response(new Blob([bytes]).stream().pipeThrough(ds)).arrayBuffer().then(
+        function(ab){ resolve(new Uint8Array(ab)); },
+        function(){ resolve(null); });
+    }catch(e){ resolve(null); }
+  });
+}
+function pdfStreamTexts(buf){
+  var bytes=new Uint8Array(buf);
+  var raw=new TextDecoder("latin1").decode(bytes);
+  var jobs=[], idx=0;
+  while(true){
+    var s=raw.indexOf("stream",idx); if(s<0) break;
+    if(raw.slice(Math.max(0,s-3),s)==="end"){ idx=s+6; continue; }
+    var start=s+6; if(raw.charAt(start)==="\r") start++; if(raw.charAt(start)==="\n") start++;
+    var e=raw.indexOf("endstream",start); if(e<0) break;
+    var dict=raw.slice(Math.max(0,s-400),s);
+    var lm=/\/Length\s+(\d+)(?!\s+\d+\s+R)/.exec(dict); /* exact byte count when the dictionary gives one directly */
+    var slice;
+    if(lm && start+parseInt(lm[1],10)<=bytes.length) slice=bytes.slice(start, start+parseInt(lm[1],10));
+    else { slice=bytes.slice(start,e); while(slice.length && (slice[slice.length-1]===10 || slice[slice.length-1]===13)) slice=slice.slice(0,slice.length-1); } /* decoders reject trailing junk after a compressed stream */
+    jobs.push((/FlateDecode/.test(dict) ? pdfInflate(slice) : Promise.resolve(slice)).then(function(out){
+      return out ? new TextDecoder("latin1").decode(out) : "";
+    }));
+    idx=e+9;
+  }
+  jobs.push(Promise.resolve(raw)); /* uncompressed PDFs keep their text inline */
+  return Promise.all(jobs).then(function(parts){ return parts.join("\n"); });
+}
+function pdfUnescape(s){
+  return s.replace(/\\([0-7]{1,3}|.)/g,function(m,c){
+    if(/^[0-7]+$/.test(c)) return String.fromCharCode(parseInt(c,8)&0xff);
+    var map={"n":"\n","r":"\r","t":"\t","b":"\b","f":"\f","(":"(",")":")","\\":"\\"};
+    return (c in map) ? map[c] : c;
+  });
+}
+function pdfHexText(hex){
+  hex=hex.replace(/\s/g,"");
+  var bytes=[]; for(var i=0;i+1<hex.length;i+=2) bytes.push(parseInt(hex.substr(i,2),16));
+  if(bytes.length>1 && bytes[0]===0xfe && bytes[1]===0xff){ /* UTF-16BE */
+    var s=""; for(var j=2;j+1<bytes.length;j+=2) s+=String.fromCharCode((bytes[j]<<8)|bytes[j+1]);
+    return s;
+  }
+  return bytes.map(function(b){return String.fromCharCode(b);}).join("");
+}
+function pdfContentText(content){
+  var out=[], re=/\((?:\\.|[^\\()])*\)|<([0-9A-Fa-f]{2,})>|\bT\*|\bTD\b/g, m;
+  while((m=re.exec(content))!==null){
+    var tok=m[0];
+    if(tok.charAt(0)==="(") out.push(pdfUnescape(tok.slice(1,-1)));
+    else if(tok.charAt(0)==="<") out.push(pdfHexText(m[1]));
+    else out.push("\n");
+  }
+  return out.join(" ");
+}
+/* Read rows of: unit ID, size, current price, status — in that order */
+function parsePdfUnits(text){
+  var t=String(text||"").replace(/(\d{1,3})\s*[x×]\s*(\d{1,3})/g,"$1x$2");
+  var toks=t.split(/\s+/).map(function(x){return x.replace(/^["'(\[{]+|["')\]}]+$/g,"");}).filter(function(x){return x;});
+  function priceOf(tok){
+    if(!/^\$?[\d,]+(\.\d+)?$/.test(tok)) return null;
+    var n=parseFloat(tok.replace(/[$,]/g,""));
+    return (!isNaN(n) && n>20 && n<100000) ? Math.round(n) : null;
+  }
+  var out=[], seen={};
+  for(var i=0;i<toks.length;i++){
+    if(!/^[A-Za-z]{1,4}-\d{1,3}$/.test(toks[i])) continue;
+    var id=toks[i].toUpperCase(); if(seen[id]) continue;
+    var size=null, price=null, status=null;
+    for(var j=i+1;j<toks.length && j<i+9;j++){
+      if(j>i+1 && /^[A-Za-z]{1,4}-\d{1,3}$/.test(toks[j])) break;
+      if(!size){ var ns=normSize(toks[j]); if(ns){ size=ns; continue; } }
+      else if(price===null){ var p=priceOf(toks[j]); if(p!==null){ price=p; continue; } }
+      if(/^(rented|occupied)$/i.test(toks[j])) status="rented";
+      else if(/^vacant$/i.test(toks[j])) status="vacant";
+    }
+    if(size && price!==null){ seen[id]=1; out.push({id:id,size:size,price:price,status:status||"vacant",seq:seqCounter++}); }
+  }
+  return out;
+}
 $("fileInput").addEventListener("change",function(e){
   var f=e.target.files[0]; if(!f) return;
   var isPdf=/\.pdf$/i.test(f.name) || f.type==="application/pdf";
   var reader=new FileReader();
   reader.onload=function(){
     if(isPdf){
-      /* PDF: pull sizes and prices out of the raw bytes where possible; anything missed needs review — PDF layouts vary by operator, and the live version has the same manual review step after parsing */
-      var txt=""; try{ txt=new TextDecoder("latin1").decode(new Uint8Array(reader.result)); }catch(err){}
-      var found=[]; var re=/(\d{1,3})\s*[x×]\s*(\d{1,3})[\s\S]{0,24}?\$?\s*(\d{2,4})/g, mm;
-      while((mm=re.exec(txt))!==null && found.length<60){
-        var key=normSize(mm[1]+"x"+mm[2]); var p=parseInt(mm[3],10);
-        if(key && p>20) found.push({id:"P-"+(found.length+1),size:key,price:p,status:"vacant",seq:seqCounter++});
-      }
-      if(found.length){ units=found; selectedId=units[0].id; refreshAll(); fitView(); toast("Parsed "+found.length+" units from the PDF — please check the sizes and prices in the list (you can edit or delete them)"); }
-      else toast("This PDF didn't yield any unit data (the layout is too unusual) — please use a CSV instead, or add units manually below; the live version has the same manual review step after parsing");
+      /* PDF: extract the text properly (streams are usually compressed), read the unit rows out of it, and review anything missed — PDF layouts vary by operator, and the live version has the same manual review step after parsing */
+      pdfStreamTexts(reader.result).then(function(content){
+        var text=pdfContentText(content);
+        var found=parsePdfUnits(text);
+        if(!found.length){
+          /* Fallback for sheets without unit IDs: a size followed shortly by a price */
+          var re=/(\d{1,3})\s*[x×]\s*(\d{1,3})[\s\S]{0,24}?\$?\s*(\d{2,4})/g, mm;
+          while((mm=re.exec(text))!==null && found.length<60){
+            var key=normSize(mm[1]+"x"+mm[2]); var p=parseInt(mm[3],10);
+            if(key && p>20) found.push({id:"P-"+(found.length+1),size:key,price:p,status:"vacant",seq:seqCounter++});
+          }
+        }
+        if(found.length){ units=found; selectedId=units[0].id; refreshAll(); resetCamAngles(); fitView(); toast("Parsed "+found.length+" units from the PDF — please check the sizes and prices in the list on the right (you can edit or delete them)"); }
+        else toast("We couldn't read any unit rows from this PDF. Some PDFs store their text as a scanned picture or in an encoding this demo can't extract — that's a limitation of this demo, not a problem with your file. A CSV with four columns (unit, size, current price, status) will always import, or you can add the units manually below.",7000);
+      });
     }else{
       var parsed=parseCSV(String(reader.result||""));
-      if(parsed.length){ units=parsed; selectedId=units[0].id; refreshAll(); fitView(); toast("Imported "+parsed.length+" units — the layout has been rebuilt and re-centred to fit"); }
+      if(parsed.length){ units=parsed; selectedId=units[0].id; refreshAll(); resetCamAngles(); fitView(); toast("Imported "+parsed.length+" units — the layout has been rebuilt and re-centred to fit"); }
       else toast("The CSV didn't yield any units: it needs a size column (e.g. 10x10) and a price column");
     }
     e.target.value="";
@@ -727,7 +823,7 @@ $("btnAdd").addEventListener("click",function(){
   units.push({id:id,size:size,price:price,status:st,seq:seqCounter++});
   selectedId=id; refreshAll(); toast("Added "+id+" — it's on the layout now");
 });
-$("btnResetData").addEventListener("click",function(){units=sampleUnits();selectedId="C-01";refreshAll();fitView();toast("Sample data restored");});
+$("btnResetData").addEventListener("click",function(){units=sampleUnits();selectedId="C-01";refreshAll();resetCamAngles();fitView();toast("Sample data restored");});
 $("btnSampleCsv").addEventListener("click",function(){
   var csv="Unit,Size,Current Price,Status\nA-01,5x5,85,Rented\nA-02,5x5,79,Vacant\nC-01,10x10,189,Vacant\nC-02,10x10,199,Rented\nE-01,10x20,319,Vacant\n";
   var a=document.createElement("a");
